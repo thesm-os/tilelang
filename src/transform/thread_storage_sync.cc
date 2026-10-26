@@ -362,6 +362,13 @@ private:
   }
 
   Stmt ProcessSharedSync(const CallNode *op, const std::string &scope) {
+    // Every thread of the block executes a sync that no constraint on a thread
+    // index guards, so the sync needs no count of its threads. Such a count
+    // asks z3 about the other constraints of the function, and z3 can give up
+    // on a nonlinear one.
+    if (thread_constraints_ == 0) {
+      return Evaluate(IRMutatorWithAnalyzer::VisitExpr_(op));
+    }
     auto bound_tx = analyzer_->const_int_bound(tx_);
     auto bound_ty = analyzer_->const_int_bound(ty_);
     auto bound_tz = analyzer_->const_int_bound(tz_);
@@ -478,7 +485,61 @@ private:
         tz_ = iv;
       }
     }
+    bool constrains = op->attr_key == tvm::tirx::attr::tilelang_assume &&
+                      DependsOnThread(Downcast<PrimExpr>(op->node));
+    return WithThreadConstraint(
+        constrains, [&] { return IRMutatorWithAnalyzer::VisitStmt_(op); });
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    return WithThreadConstraint(DependsOnThread(op->condition), [&] {
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
+    });
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    bool constrains = DependsOnThread(op->min) || DependsOnThread(op->extent);
+    if (auto step = op->step) {
+      constrains = constrains || DependsOnThread(step.value());
+    }
+    return WithThreadConstraint(
+        constrains, [&] { return IRMutatorWithAnalyzer::VisitStmt_(op); });
+  }
+
+  Stmt VisitStmt_(const AssertStmtNode *op) final {
+    // An assert constrains the statements after it until its scope ends.
+    if (DependsOnThread(op->condition)) {
+      ++thread_constraints_;
+    }
     return IRMutatorWithAnalyzer::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const BindNode *op) final {
+    if (DependsOnThread(op->value)) {
+      thread_lets_.insert(op->var.get());
+    }
+    return IRMutatorWithAnalyzer::VisitStmt_(op);
+  }
+
+  bool DependsOnThread(const PrimExpr &expr) const {
+    return UsesVar(expr, [this](const VarNode *var) {
+      return var == tx_->var.get() || var == ty_->var.get() ||
+             var == tz_->var.get() || thread_lets_.count(var) != 0;
+    });
+  }
+
+  /*!
+   * \brief Visit a statement with one more thread constraint in scope when
+   *        \p constrains is true. The asserts inside the statement end with
+   *        it, as the constraints of the analyzer do.
+   */
+  template <typename Visit>
+  Stmt WithThreadConstraint(bool constrains, Visit visit) {
+    int saved = thread_constraints_;
+    thread_constraints_ += constrains ? 1 : 0;
+    Stmt result = visit();
+    thread_constraints_ = saved;
+    return result;
   }
 
   bool IsFullThreadExtent(const IterVar &iv,
@@ -504,6 +565,11 @@ private:
   // by an earlier ThreadSync run for another storage scope.
   std::unordered_set<size_t> used_barrier_ids_;
   int warp_size_;
+  // The constraints in scope that depend on a thread index. Each one can keep
+  // some threads of the block from the statements in its scope.
+  int thread_constraints_{0};
+  // The let variables whose values depend on a thread index.
+  std::unordered_set<const VarNode *> thread_lets_;
 };
 
 struct ConditionThreadProperty {

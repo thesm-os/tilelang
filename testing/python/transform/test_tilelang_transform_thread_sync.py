@@ -2462,5 +2462,46 @@ def test_waw_uses_all_thread_axes(axis, shift):
     assert len(_storage_syncs(lowered)) == shift
 
 
+def test_unguarded_sync_after_nonlinear_loop_is_a_full_barrier():
+    """A barrier that no thread-dependent constraint guards needs no thread count.
+
+    The analyzer keeps the range of ``k`` after the loop, and the extent of that
+    range multiplies ``bz`` by an expression of ``n``. Counting the threads of the
+    barrier then asks z3 to solve nonlinear arithmetic at each step, and z3 gives up
+    within its budget. Every thread of the block executes the barrier, so it is
+    a full barrier.
+    """
+
+    @T.prim_func(private=True)
+    def func(n: T.int32):
+        s = T.alloc_buffer((128,), dtype="float32", scope="shared")
+        l = T.alloc_buffer((1,), dtype="float32", scope="local")
+        bx = T.launch_thread("blockIdx.x", 8)
+        bz = T.launch_thread("blockIdx.z", 8)
+        tx = T.launch_thread("threadIdx.x", 128)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        for k in range(
+            T.max(
+                T.min(
+                    (T.max((n + 31) // 32 - T.max(n - 1024, 0) // 32, 0) + 7) // 8,
+                    T.max(n + 31, T.max(n - 1024, 0)) // 32
+                    - T.max(n - 1024, 0) // 32
+                    - bz * ((T.max((n + 31) // 32 - T.max(n - 1024, 0) // 32, 0) + 7) // 8),
+                ),
+                0,
+            )
+            - 1
+        ):
+            s[tx] = T.cast(tx + k, "float32")
+        T.tvm_storage_sync("shared")
+        l[0] = s[(tx + 64) % 128]
+
+    lowered = tilelang.transform.ThreadSync("shared")(tvm.IRModule({"main": func}))["main"]
+    syncs = _storage_syncs(lowered)
+    assert len(syncs) == 1, "Expected the barrier of the program"
+    assert not _storage_syncs(lowered, arg_count=3), "Expected no partial barrier"
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
