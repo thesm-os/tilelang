@@ -1104,6 +1104,64 @@ def test_partial_sync_warp_multiple_still_lowered():
     assert not _storage_syncs(guard)
 
 
+@tilelang.testing.requires_cuda
+def test_partial_sync_inside_bitwise_and_condition():
+    """Regression test for issue #3653: a block-uniform condition written with
+    `&` must not stop the proof that a warp-multiple guard is warp-uniform."""
+
+    @T.prim_func(private=True)
+    def func(lengths: T.Buffer((4,), "int32")):
+        S = T.alloc_buffer((448,), dtype="float32", scope="shared")
+        acc = T.alloc_buffer((1,), dtype="float32", scope="local")
+        bx = T.launch_thread("blockIdx.x", 10)
+        tx = T.launch_thread("threadIdx.x", 512)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        tk: T.int32 = lengths[bx % 4]
+        if T.bitwise_and(bx % 10 < 2, tk > 0):
+            if tx < 448:
+                acc[0] = T.float32(0)
+                for i in range(2):
+                    S[tx] = T.float32(1)
+                    acc[0] += S[447 - tx]
+
+    mod = tvm.IRModule({"main": func})
+    mod = tilelang.transform.ThreadSync("shared")(mod)
+    lowered = mod["main"]
+    guard = _guard(lowered, _thread_var(lowered) < 448)
+    syncs = _assert_syncs_inside(lowered, guard.then_case, arg_count=3)
+    _assert_partial_sync_params(syncs, 448)
+
+
+@tilelang.testing.requires_cuda
+def test_no_sync_between_disjoint_writes_after_bitwise_and_binding():
+    """A boolean bound with `&` must not stop the proof that the threads below
+    128 write disjoint words, so ThreadSync does not place a barrier in the guard."""
+
+    @T.prim_func(private=True)
+    def func(slots: T.Buffer((4,), "int32"), out: T.Buffer((8, 256), "float32")):
+        S = T.alloc_buffer((512,), dtype="float32", scope="shared")
+        bx = T.launch_thread("blockIdx.x", 4)
+        tx = T.launch_thread("threadIdx.x", 256)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        slot: T.int32 = slots[bx]
+        inside: T.bool = T.bitwise_and(0 <= slot, slot < 8)
+        if tx < 128:
+            S[tx // 32 * 128 + tx % 32] = T.float32(1)
+            S[tx // 32 * 128 + tx % 32 + 32] = T.float32(2)
+        T.tvm_storage_sync("shared")
+        if inside:
+            out[slot, tx] = S[tx] + S[tx + 256]
+
+    mod = tvm.IRModule({"main": func})
+    mod = tilelang.transform.ThreadSync("shared")(mod)
+    lowered = mod["main"]
+    guard = _guard(lowered, _thread_var(lowered) < 128)
+    assert not _storage_syncs(guard, arg_count=1), "Disjoint writes got a full barrier"
+    assert not _storage_syncs(guard, arg_count=3), "Disjoint writes got a partial barrier"
+
+
 def test_partial_sync_ids_unique_across_storage_scopes():
     """The pipeline runs ThreadSync once for "shared" and once for "shared.dyn".
     Two disjoint thread ranges must not end up on the same named barrier: each
