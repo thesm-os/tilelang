@@ -12,7 +12,6 @@
 #include <tvm/tirx/transform.h>
 
 #include "cuda/op/builtin.h"
-#include "op/utils.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 #include <functional>
@@ -172,10 +171,9 @@ private:
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    // A SIMT copy stores the values that the threads load into shared
-    // memory. A store into a register, such as a local variable that the
-    // producer computes for its TMA coordinates, is no copy.
-    if (IsSharedBuffer(op->buffer)) {
+    auto scope =
+        runtime::StorageScope::Create(GetPtrStorageScope(op->buffer->data));
+    if (scope.to_string() != "global") {
       has_simt_copy_ = true;
     }
     StmtExprVisitor::VisitStmt_(op);
