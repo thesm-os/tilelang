@@ -39,10 +39,10 @@ bool IsValidCPAsyncTransferBytes(int64_t bytes) {
   return bytes == 4 || bytes == 8 || bytes == 16;
 }
 
-bool IsProvablyDivisible(const PrimExpr &expr, int64_t divisor) {
+bool IsProvablyDivisible(arith::Analyzer *analyzer, const PrimExpr &expr,
+                         int64_t divisor) {
   ICHECK_GT(divisor, 0);
-  arith::Analyzer analyzer;
-  arith::ModularSet modular_set = analyzer.modular_set(expr);
+  arith::ModularSet modular_set = analyzer->modular_set(expr);
   return modular_set->coeff % divisor == 0 && modular_set->base % divisor == 0;
 }
 
@@ -5584,7 +5584,8 @@ void CodeGenTileLangCUDA::VisitExpr_(const BufferLoadNode *op,
       // bytes as one vector carrier, so its logical base must be aligned to
       // the full vector lane count.
       if (is_packed_int4_vector) {
-        can_vector_load = IsProvablyDivisible(base.Eval(), value_dtype.lanes());
+        can_vector_load =
+            IsProvablyDivisible(&analyzer_, base.Eval(), value_dtype.lanes());
       }
     }
 
@@ -5728,7 +5729,7 @@ void CodeGenTileLangCUDA::VisitStmt_(const BufferStoreNode *op) {
         arith::ramp(base, 1, ramp_lanes).Match(index_expr);
     if (is_packed_int4_vector &&
         (!is_unit_stride_ramp ||
-         !IsProvablyDivisible(base.Eval(), value_dtype.lanes()))) {
+         !IsProvablyDivisible(&analyzer_, base.Eval(), value_dtype.lanes()))) {
       LOG(FATAL)
           << "Packed int4/uint4 vector stores require a unit-stride ramp "
              "with a logical base provably divisible by the vector lane "

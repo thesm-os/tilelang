@@ -88,6 +88,7 @@ def _packed_vector_load_source(
     dynamic_base=False,
     dynamic_scale=1,
     lanes=2,
+    bound_base=False,
 ):
     name = f"packed_{dtype}_x{lanes}_load"
     buffer = tirx.decl_buffer((64,), dtype=dtype, name="input")
@@ -103,14 +104,21 @@ def _packed_vector_load_source(
     else:
         base_expr = tirx.const(base, "int32")
 
+    bind = None
+    if bound_base:
+        bound = tirx.Var("bound_base", "int32")
+        bind = tirx.Bind(bound, base_expr)
+        base_expr = bound
+
     index = tirx.Ramp(
         base_expr,
         tirx.const(stride, "int32"),
         lanes,
     )
+    body = tirx.Evaluate(tirx.BufferLoad(buffer, [index]))
     func = tirx.PrimFunc(
         params,
-        tirx.Evaluate(tirx.BufferLoad(buffer, [index])),
+        body if bind is None else tirx.SeqStmt([bind, body]),
         buffer_map={buffer.data: buffer},
     )
     func = func.with_attr("global_symbol", name)
@@ -131,6 +139,7 @@ def _packed_vector_store_source(
     dynamic_base=False,
     dynamic_scale=1,
     lanes=2,
+    bound_base=False,
 ):
     name = f"packed_{dtype}_x{lanes}_store"
     buffer = tirx.decl_buffer((64,), dtype=dtype, name="output")
@@ -147,14 +156,21 @@ def _packed_vector_store_source(
     else:
         base_expr = tirx.const(base, "int32")
 
+    bind = None
+    if bound_base:
+        bound = tirx.Var("bound_base", "int32")
+        bind = tirx.Bind(bound, base_expr)
+        base_expr = bound
+
     index = tirx.Ramp(
         base_expr,
         tirx.const(stride, "int32"),
         lanes,
     )
+    body = tirx.BufferStore(buffer, value, [index])
     func = tirx.PrimFunc(
         params,
-        tirx.BufferStore(buffer, value, [index]),
+        body if bind is None else tirx.SeqStmt([bind, body]),
         buffer_map={buffer.data: buffer},
     )
     func = func.with_attr("global_symbol", name)
@@ -376,6 +392,51 @@ def test_packed_int4x2_aligned_store_keeps_direct_path(
         stride=1,
         dynamic_base=dynamic_base,
         dynamic_scale=dynamic_scale,
+    )
+
+    assert f"(({storage_type}*)output)" in source
+    assert f"tl_{dtype}_packed_store(" not in source
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    ("dtype", "storage_type"),
+    [
+        ("int4", "int8_t"),
+        ("uint4", "uint8_t"),
+    ],
+)
+def test_packed_int4x2_bound_aligned_load_keeps_direct_path(dtype, storage_type):
+    source = _packed_vector_load_source(
+        dtype,
+        base=0,
+        stride=1,
+        dynamic_base=True,
+        dynamic_scale=2,
+        bound_base=True,
+    )
+
+    assert f"(({storage_type}*)input)" in source
+    assert not _generated_call_lines(source, f"tl_{dtype}_packed_load")
+    assert not _generated_call_lines(source, f"tl_pack_{dtype}x2")
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    ("dtype", "storage_type"),
+    [
+        ("int4", "int8_t"),
+        ("uint4", "uint8_t"),
+    ],
+)
+def test_packed_int4x2_bound_aligned_store_keeps_direct_path(dtype, storage_type):
+    source = _packed_vector_store_source(
+        dtype,
+        base=0,
+        stride=1,
+        dynamic_base=True,
+        dynamic_scale=2,
+        bound_base=True,
     )
 
     assert f"(({storage_type}*)output)" in source
