@@ -29,12 +29,6 @@ def allow_vectorize(pass_ctx: PassContext | None = None) -> bool:
     return not disable_vectorize
 
 
-def allow_cse(pass_ctx: PassContext | None = None) -> bool:
-    if pass_ctx is None:
-        pass_ctx = tilelang.transform.get_pass_context()
-    return not pass_ctx.config.get(tilelang.PassConfigKey.TIR_DISABLE_CSE, False)
-
-
 def allow_global_thread_synchronization(pass_ctx: PassContext | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()

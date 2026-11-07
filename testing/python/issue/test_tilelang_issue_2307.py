@@ -1,7 +1,6 @@
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang import tvm as tvm
 from tvm.target import Target
 
 
@@ -20,9 +19,7 @@ def _get_issue_2307_source() -> str:
                     T.device_assert(T.isfinite(score_fragment[i]))
 
     target = Target("cuda")
-    # The test reads the guard of the assert from the source, and CSE moves the
-    # guard into a variable.
-    with tvm.transform.PassContext(config={tilelang.PassConfigKey.TIR_DISABLE_CSE: True}), target:
+    with target:
         artifact = tilelang.lower(main, target=target)
     return artifact.kernel_source
 

@@ -197,9 +197,7 @@ def test_static_ragged_copy_allows_1024_elements_384_threads():
         with T.Kernel(1, threads=threads):
             T.copy(A, B, coalesced_width=1)
 
-    # The test reads the index of the copy from the source, and CSE moves the
-    # index into a variable.
-    with tvm.transform.PassContext(config={tl.PassConfigKey.TIR_DISABLE_CSE: True}), tvm.target.Target(auto_target):
+    with tvm.target.Target(auto_target):
         artifact = tl.lower(main, target=auto_target, enable_device_compile=False)
 
     kernel_source = str(artifact.kernel_source)
@@ -348,9 +346,6 @@ def test_spill_pricing_no_false_positive_on_strided_fragment_layouts():
             tl.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
             tl.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
             tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-            # The test reads the thread stride of each shared load from the
-            # source, and CSE moves the stride into a variable.
-            tl.PassConfigKey.TIR_DISABLE_CSE: True,
         },
     )
     src = kern.get_kernel_source()
