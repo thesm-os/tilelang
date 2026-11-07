@@ -2,6 +2,7 @@
 
 import re
 
+import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
@@ -148,6 +149,45 @@ def matmul_windowed_pipelined(
                 T.copy(A[by * block_M, ko * block_K], A_shared)
                 T.copy(B[ko * block_K, bx * block_N], B_shared)
                 T.gemm(A_shared, B_shared, C_local)
+
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return main
+
+
+def matmul_outer_loop_pipelined(M, N, K, block_M, block_K, block_N, num_stages, runs, dtype="float16", threads=128):
+    """A pipelined GEMM that runs its K-loop once for each of runs parts of K.
+
+    The block carries the start of the next part in a local variable from one run to the next, as a
+    persistent kernel carries the position of its next tile.
+    """
+    iterations = (K + block_K - 1) // block_K
+
+    @T.prim_func
+    def main(
+        A: T.Buffer((M, K), dtype),
+        B: T.Buffer((K, N), dtype),
+        C: T.Buffer((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (
+            bx,
+            by,
+        ):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_local = T.alloc_fragment((block_M, block_N), "float32")
+            start = T.alloc_var(T.int32, init=0)
+
+            T.clear(C_local)
+
+            for _ in T.serial(runs):
+                k0 = T.alloc_var(T.int32, init=start)
+                k1 = T.alloc_var(T.int32, init=T.min(iterations, k0 + iterations // runs))
+                for ko in T.Pipelined(k1 - k0, num_stages=num_stages):
+                    T.copy(A[by * block_M, (k0 + ko) * block_K], A_shared)
+                    T.copy(B[(k0 + ko) * block_K, bx * block_N], B_shared)
+                    T.gemm(A_shared, B_shared, C_local)
+                start = start + (k1 - k0)
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -521,6 +561,29 @@ def test_tiled_ws_stage1_dynamic_loop_start():
             acc += A[:, k_slice].float() @ B[k_slice, n_slice].float()
         ref[:, n_slice] = acc
 
+    torch.testing.assert_close(C.float(), ref, rtol=1e-2, atol=1e-2)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
+@pytest.mark.parametrize("runs", [1, 2])
+def test_tiled_ws_outer_loop_carries_k_start(runs):
+    """Tiled WS keeps the state that an outer loop carries between runs of the pipeline."""
+    import torch
+
+    M, N, K = 256, 256, 256
+    func = matmul_outer_loop_pipelined(M, N, K, 64, 32, 64, num_stages=2, runs=runs)
+    target = determine_target()
+    kernel = tilelang.compile(func, target=target, out_idx=[2])
+    source = kernel.get_kernel_source()
+
+    assert "__launch_bounds__(256, 1)" in source
+
+    A = torch.randn(M, K, dtype=torch.float16, device="cuda")
+    B = torch.randn(K, N, dtype=torch.float16, device="cuda")
+    C = kernel(A, B)
+
+    ref = A.float() @ B.float()
     torch.testing.assert_close(C.float(), ref, rtol=1e-2, atol=1e-2)
 
 

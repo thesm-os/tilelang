@@ -1783,11 +1783,19 @@ private:
                                dummy_producer, dummy_consumer);
     dummy_ws =
         AttrStmt(ws_partition, attr::kWarpSpecializationScope, 0, dummy_ws);
+    branch_state_unsupported_ = false;
     Optional<Stmt> replaced =
         ReplacePipelineLoopInStmt(orig_block->body, pipeline_loop, dummy_ws,
                                   producer_extent, consumer_extent);
     ICHECK(replaced.defined())
         << "ProducerConsumerWS: failed to replace pipeline loop";
+    if (branch_state_unsupported_) {
+      // A fragment or local buffer that the producer needs is defined outside
+      // a loop around the pipeline, or after the pipeline for its next run.
+      // Its producer copy would not be initialized, so the block keeps its
+      // pipeline without warp specialization.
+      return StmtExprMutator::VisitStmt_(orig_realize);
+    }
     Stmt replaced_stmt = replaced.value();
 
     // Producer and consumer partitions cannot safely share the same block-level
@@ -2243,7 +2251,7 @@ private:
       new_seq.push_back(rewritten_loop.value());
 
       for (int i = loop_idx + 1; i < static_cast<int>(op->seq.size()); ++i) {
-        new_seq.push_back(GuardConsumerOnly(op->seq[i]));
+        new_seq.push_back(PlacePostlude(op->seq[i]));
       }
       return new_seq.size() == 1 ? new_seq[0] : SeqStmt(new_seq);
     }
@@ -2300,10 +2308,15 @@ private:
     }
 
     Optional<Stmt> VisitStmt_(const ForNode *op) final {
+      ++loops_above_;
       Optional<Stmt> body = VisitStmt(op->body);
+      --loops_above_;
       if (!body.defined()) {
         return Optional<Stmt>();
       }
+      // The pipeline runs once in each iteration of this loop, so the levels
+      // that enclose the loop run their statements once for all of those runs.
+      ++loops_below_;
       For new_for = GetRef<For>(op);
       new_for.CopyOnWrite()->body = body.value();
       return new_for;
@@ -2321,6 +2334,88 @@ private:
           false);
       return IfThenElse(GE(rewriter_->thread_iv_->var, producer_extent_),
                         rewritten);
+    }
+
+    /*!
+     * \brief Whether \p stmt reads state that a loop around the pipeline can
+     *  change.
+     *
+     * That state is a branch-private buffer that \p loop_access writes, or any
+     * buffer of another scope, such as shared memory that the pipeline fills.
+     */
+    bool ReadsLoopState(const Stmt &stmt,
+                        const LocalAccessSummary &loop_access) const {
+      LocalAccessSummary summary = LocalAccessCollector::Collect(
+          stmt, rewriter_->buffer_data_to_buffer_);
+      for (const auto &buffer : summary.read_buffers) {
+        if (loop_access.write_buffers.count(buffer)) {
+          return true;
+        }
+      }
+      for (const auto &buffer : summary.write_buffers) {
+        if (loop_access.write_buffers.count(buffer)) {
+          return true;
+        }
+      }
+      bool reads_other_scope = false;
+      PostOrderVisit(stmt, [&](const ObjectRef &node) {
+        if (const auto *load = node.as<BufferLoadNode>()) {
+          if (!IsFragmentBuffer(load->buffer) &&
+              !IsLocalBuffer(load->buffer, /*allow_var=*/true)) {
+            reads_other_scope = true;
+          }
+        } else if (const auto *call = node.as<CallNode>()) {
+          // A tile operator or an access pointer can read any buffer, and a
+          // pure call reads only its arguments.
+          if (SideEffect(GetRef<PrimExpr>(call)) > CallEffectKind::kPure) {
+            reads_other_scope = true;
+          }
+        }
+      });
+      return reads_other_scope;
+    }
+
+    /*! \brief Whether \p stmt writes a fragment or local buffer, which the
+     *  producer branch would read through a copy of its own. */
+    bool WritesBranchPrivateBuffer(const Stmt &stmt) const {
+      LocalAccessSummary summary = LocalAccessCollector::Collect(
+          stmt, rewriter_->buffer_data_to_buffer_);
+      for (const auto &buffer : summary.write_buffers) {
+        if (IsFragmentBuffer(buffer) || IsLocalBuffer(buffer)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /*!
+     * \brief Place a statement that follows the pipeline in its sequence.
+     *
+     * A statement after the pipeline belongs to the consumer, unless a loop
+     * encloses the sequence and the statement defines state that the producer
+     * reads in the next run of the pipeline, such as the start of the next
+     * tile of a persistent kernel. Such a statement runs in both branches.
+     */
+    Stmt PlacePostlude(const Stmt &stmt) {
+      if (loops_above_ == 0) {
+        return GuardConsumerOnly(stmt);
+      }
+      LocalAccessSummary summary = LocalAccessCollector::Collect(
+          stmt, rewriter_->buffer_data_to_buffer_);
+      if (!summary.HasTrackedDefs() ||
+          !rewriter_->producer_prelude_live_seed_.NeedsAnyDef(summary)) {
+        return GuardConsumerOnly(stmt);
+      }
+      if (WritesBranchPrivateBuffer(stmt)) {
+        rewriter_->branch_state_unsupported_ = true;
+        return GuardConsumerOnly(stmt);
+      }
+      Stmt consumer = PCThreadIdxRewriter::Rewrite(
+          stmt, rewriter_->thread_iv_->var,
+          rewriter_->thread_iv_->var - producer_extent_, consumer_extent_,
+          false);
+      return IfThenElse(LT(rewriter_->thread_iv_->var, producer_extent_), stmt,
+                        consumer);
     }
 
     void PropagatePreludeLiveness(const SeqStmtNode *op, int loop_idx) {
@@ -2371,32 +2466,78 @@ private:
       // Shared-prelude statements stay in place; branch-private definitions
       // move next to the branch that consumes them, or are duplicated when
       // both producer and consumer need the same definition.
+      //
+      // The branches start where the pipeline loop was. A loop between this
+      // sequence and the pipeline would run a moved statement once in each of
+      // its iterations, so above such a loop a statement stays at its level:
+      // a consumer-only statement under the consumer guard, and the others for
+      // every thread, as before the rewrite. The exception is a statement that
+      // writes a fragment or local buffer that the producer reads through its
+      // own copy. It moves into the branches only when each iteration
+      // recomputes the same values, because it reads nothing that the loop
+      // writes.
+      Array<Stmt> producer_init;
+      Array<Stmt> consumer_init;
+      LocalAccessSummary loop_access;
+      if (loops_below_ > 0) {
+        loop_access = LocalAccessCollector::Collect(
+            op->seq[loop_idx], rewriter_->buffer_data_to_buffer_);
+      }
       for (int i = 0; i < loop_idx; ++i) {
-        switch (ClassifyPreludeStmt(op->seq[i],
-                                    rewriter_->buffer_data_to_buffer_,
-                                    rewriter_->shared_prelude_live_seed_,
-                                    rewriter_->producer_prelude_live_seed_,
-                                    rewriter_->consumer_prelude_live_seed_)) {
+        const Stmt &stmt = op->seq[i];
+        PreludeStmtPlacement placement =
+            ClassifyPreludeStmt(stmt, rewriter_->buffer_data_to_buffer_,
+                                rewriter_->shared_prelude_live_seed_,
+                                rewriter_->producer_prelude_live_seed_,
+                                rewriter_->consumer_prelude_live_seed_);
+        if (loops_below_ > 0 &&
+            placement != PreludeStmtPlacement::kKeepSharedPrelude) {
+          bool producer_copy =
+              placement != PreludeStmtPlacement::kConsumerOnly &&
+              WritesBranchPrivateBuffer(stmt);
+          if (!producer_copy) {
+            new_seq->push_back(placement == PreludeStmtPlacement::kConsumerOnly
+                                   ? GuardConsumerOnly(stmt)
+                                   : stmt);
+            continue;
+          }
+          if (ReadsLoopState(stmt, loop_access)) {
+            rewriter_->branch_state_unsupported_ = true;
+            new_seq->push_back(stmt);
+            continue;
+          }
+        }
+        switch (placement) {
         case PreludeStmtPlacement::kProducerOnly:
-          rewriter_->extracted_producer_init_.push_back(op->seq[i]);
+          producer_init.push_back(stmt);
           break;
         case PreludeStmtPlacement::kConsumerOnly:
-          rewriter_->extracted_consumer_init_.push_back(op->seq[i]);
+          consumer_init.push_back(stmt);
           break;
         case PreludeStmtPlacement::kDuplicateToBoth:
-          rewriter_->extracted_producer_init_.push_back(op->seq[i]);
-          rewriter_->extracted_consumer_init_.push_back(op->seq[i]);
+          producer_init.push_back(stmt);
+          consumer_init.push_back(stmt);
           break;
         case PreludeStmtPlacement::kKeepSharedPrelude:
-          if (auto it = rewriter_->common_prelude_rewrites_.find(op->seq[i]);
+          if (auto it = rewriter_->common_prelude_rewrites_.find(stmt);
               it != rewriter_->common_prelude_rewrites_.end()) {
             new_seq->push_back(it->second);
           } else {
-            new_seq->push_back(op->seq[i]);
+            new_seq->push_back(stmt);
           }
           break;
         }
       }
+      // The nested sequences were classified first, and this level runs before
+      // them, so its statements come first in each branch.
+      for (const Stmt &stmt : rewriter_->extracted_producer_init_) {
+        producer_init.push_back(stmt);
+      }
+      for (const Stmt &stmt : rewriter_->extracted_consumer_init_) {
+        consumer_init.push_back(stmt);
+      }
+      rewriter_->extracted_producer_init_ = producer_init;
+      rewriter_->extracted_consumer_init_ = consumer_init;
     }
 
     ProducerConsumerWSRewriter *rewriter_;
@@ -2404,6 +2545,11 @@ private:
     Stmt ws_body_;
     PrimExpr producer_extent_;
     PrimExpr consumer_extent_;
+    /*! \brief The loops that enclose the statement being visited. */
+    int loops_above_{0};
+    /*! \brief The loops between the sequence being classified and the
+     *  pipeline loop. */
+    int loops_below_{0};
   };
 
   Optional<Stmt> ReplacePipelineLoopInStmt(const Stmt &stmt,
@@ -2457,6 +2603,9 @@ private:
   LocalLiveSet consumer_prelude_live_seed_;
   Array<Stmt> extracted_producer_init_;
   Array<Stmt> extracted_consumer_init_;
+  /*! \brief Whether the producer needs branch-private state that its branch
+   *  cannot initialize; see PipelineLoopInStmtReplacer. */
+  bool branch_state_unsupported_{false};
 };
 
 // ---------------------------------------------------------------------------
