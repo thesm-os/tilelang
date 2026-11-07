@@ -12,8 +12,9 @@
  *   framework (e.g. PyTorch ROCm).
  *
  * Additionally, this stub provides wrappers for the minimal HSA APIs used by
- * TVM's ROCm device existence check (hsa_init / hsa_shut_down) so that a ROCm
- * enabled build can still be imported on machines without ROCm installed.
+ * TVM's ROCm device existence check (hsa_init / hsa_shut_down), and reports no
+ * device from hipGetDeviceCount without libamdhip64.so, so that a ROCm enabled
+ * build can still be imported on machines without ROCm installed.
  */
 
 #include "hip.h"
@@ -271,6 +272,15 @@ hipError_t hipGetDevice(int *deviceId) {
 }
 
 hipError_t hipGetDeviceCount(int *count) {
+  // TVM's ROCm device existence check calls this when it canonicalizes a HIP
+  // target. Without libamdhip64.so there is no device, so report none as the
+  // HIP runtime does on a machine without a GPU.
+  if (!HIPDriverAPI::is_available()) {
+    if (count != nullptr) {
+      *count = 0;
+    }
+    return hipErrorNoDevice;
+  }
   // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
   return HIPDriverAPI::get()->hipGetDeviceCount_(count);
 }
