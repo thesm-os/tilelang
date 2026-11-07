@@ -12,6 +12,7 @@ from tvm.target import Target
 from tilelang.engine.param import KernelParam, CompiledArtifact
 from tilelang.engine.semantic_check import PreLowerSemanticCheck
 from tilelang.backend.module import BackendContext, create_backend_context
+from tilelang.backend.pass_pipeline.pipeline_utils import allow_cse
 from tilelang.instrumentation import (
     compile_pass_instrumentation,
     current_compile_pass_instrumentation,
@@ -93,6 +94,11 @@ def _prepare_device_codegen_mod(device_mod: tvm.IRModule) -> tvm.IRModule:
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
     device_mod = tirx.transform.Simplify()(device_mod)
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
+    if allow_cse():
+        # Simplify inlines every pure integer binding into each of its uses,
+        # such as a tile index that the kernel computes once. Bind each repeated
+        # subexpression to one variable again, so the device code computes it once.
+        device_mod = tirx.transform.CommonSubexprElim()(device_mod)
     return device_mod
 
 
