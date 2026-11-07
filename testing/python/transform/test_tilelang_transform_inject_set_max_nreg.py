@@ -212,5 +212,119 @@ def test_auto_ws_reg_hints_lower_into_matching_role_scopes():
     assert consumer_branch < reg_alloc
 
 
+@tilelang.testing.requires_cuda
+def test_inject_set_max_nreg_with_register_store_in_producer():
+    """A store into a register of the producer is no SIMT copy, so the default hints apply."""
+
+    @T.prim_func
+    def before(A: T.Tensor((512, 512), T.float16)):
+        bx = T.launch_thread("blockIdx.x", 8)
+        v = T.launch_thread("threadIdx.x", 256)
+
+        with T.sblock(""):
+            T.reads(A[bx * 64, 0:512])
+            T.writes()
+
+            A_shared = T.alloc_buffer((3, 1, 8, 256), T.float16, scope="shared.dyn")
+            row = T.alloc_buffer((1,), T.int32, scope="local")
+
+            mbars = T.alloc_barrier([128, 128, 128, 128, 128, 128])
+            T.attr([128, 128], "kWarpSpecializationScope", 0)
+
+            if v < 128:
+                # Producer branch - stores the TMA row into a register
+                row[0] = bx * 64
+                for k in range(16):
+                    T.mbarrier_wait_parity(mbars[k % 3 + 3], T.bitwise_xor(k // 3 % 2, 1))
+                    if v == 0:
+                        T.tma_load(
+                            T.create_tma_descriptor(6, 2, A.data, 512, 512, 2, 1024, 32, 64, 1, 1, 0, 2, 2, 0),
+                            mbars[k % 3],
+                            T.tvm_access_ptr(T.type_annotation(T.float16), A_shared.data, k % 3 * 2048, 2048, 2),
+                            k * 32,
+                            row[0],
+                        )
+                    T.ptx_arrive_barrier(mbars[k % 3])
+            else:
+                # Consumer branch
+                for k in range(16):
+                    T.mbarrier_wait_parity(mbars[k % 3], k // 3 % 2)
+                    T.ptx_arrive_barrier(mbars[k % 3 + 3])
+
+    mod = tvm.IRModule.from_expr(before.with_attr("global_symbol", "main"))
+    mod = tl.cuda.transform.AnnotateWarpGroupRegAlloc()(mod)
+    mod = tl.transform.LowerOpaqueBlock()(mod)
+
+    _find_if_with_set_max_nreg(mod["main"], (24, 0), (240, 1))
+
+
+@tilelang.testing.requires_cuda
+def test_skip_set_max_nreg_with_simt_copy_in_producer():
+    """A producer that stores into shared memory with SIMT stores keeps its registers."""
+
+    @T.prim_func
+    def before(A: T.Tensor((512, 512), T.float16), B: T.Tensor((512, 512), T.float16)):
+        bx = T.launch_thread("blockIdx.x", 8)
+        v = T.launch_thread("threadIdx.x", 256)
+
+        with T.sblock(""):
+            T.reads(A[bx * 64, 0:128])
+            T.writes(B[bx * 64, 0:128])
+
+            A_shared = T.alloc_buffer((128,), T.float16, scope="shared")
+            T.attr([128, 128], "kWarpSpecializationScope", 0)
+
+            if v < 128:
+                A_shared[v] = A[bx * 64, v]
+            else:
+                B[bx * 64, v - 128] = A_shared[v - 128]
+
+    mod = tvm.IRModule.from_expr(before.with_attr("global_symbol", "main"))
+    mod = tl.cuda.transform.AnnotateWarpGroupRegAlloc()(mod)
+    mod = tl.transform.LowerOpaqueBlock()(mod)
+
+    assert not _collect_set_max_nreg(mod["main"].body)
+
+
+@tilelang.testing.requires_cuda_compute_version(9, 0)
+def test_auto_ws_reg_alloc_with_local_var_coordinate():
+    """A local variable in a TMA coordinate should keep the default register reallocation."""
+
+    M = N = K = 256
+    block_m = block_n = 128
+    block_k = 32
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((M, K), T.float16),
+        B: T.Tensor((K, N), T.float16),
+        C: T.Tensor((M, N), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(N, block_n), T.ceildiv(M, block_m), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_m, block_k), T.float16)
+            B_shared = T.alloc_shared((block_k, block_n), T.float16)
+            C_local = T.alloc_fragment((block_m, block_n), T.float32)
+            row = T.alloc_var(T.int32, init=by * block_m)
+
+            T.clear(C_local)
+            for ko in T.Pipelined(T.ceildiv(K, block_k), num_stages=3):
+                T.copy(A[row, ko * block_k], A_shared)
+                T.copy(B[ko * block_k, bx * block_n], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+
+            T.copy(C_local, C[by * block_m, bx * block_n])
+
+    pass_configs = {
+        tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False,
+        tl.PassConfigKey.TL_ENABLE_FAST_MATH: False,
+    }
+    with tl.testing.without_kernel_cache():
+        kernel_mod = tl.compile(kernel, target="cuda", pass_configs=pass_configs, out_idx=[-1])
+        src = kernel_mod.get_kernel_source()
+
+    assert "tl::warpgroup_reg_dealloc<24>();" in src
+    assert "tl::warpgroup_reg_alloc<240>();" in src
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
