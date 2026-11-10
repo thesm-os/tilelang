@@ -2350,6 +2350,34 @@ private:
                         rewritten);
     }
 
+    /*!
+     * \brief Whether every thread can run a statement that both partitions
+     *  need, where it is, in place of a copy for each partition.
+     *
+     * The statement writes local variables alone and reads no fragment, no
+     * local buffer and no thread index. A local variable is never cloned for
+     * the producer, so the copy of each partition would be this statement over
+     * the same buffers. One copy for every thread computes the same values,
+     * and its stores stay outside the thread guards of the partitions, so a
+     * loop bound or a condition that reads them stays uniform for ThreadSync.
+     */
+    bool RunsForEveryThread(const LocalAccessSummary &summary) const {
+      if (summary.write_buffers.empty() || !summary.def_vars.empty()) {
+        return false;
+      }
+      for (const auto &buffer : summary.write_buffers) {
+        if (!IsLocalVarBuffer(buffer)) {
+          return false;
+        }
+      }
+      for (const auto &buffer : summary.read_buffers) {
+        if (!IsLocalVarBuffer(buffer)) {
+          return false;
+        }
+      }
+      return !summary.read_vars.count(rewriter_->thread_iv_->var);
+    }
+
     void PropagatePreludeLiveness(const SeqStmtNode *op, int loop_idx,
                                   bool across_control_flow) {
       LocalLiveSet shared_live = rewriter_->shared_prelude_live_seed_;
@@ -2381,7 +2409,13 @@ private:
         bool shared_needs = shared_live.NeedsAnyDef(summary);
         bool producer_needs = producer_live.NeedsAnyDef(summary);
         bool consumer_needs = consumer_live.NeedsAnyDef(summary);
-        if (shared_needs || (!producer_needs && !consumer_needs)) {
+        // A statement that both partitions need and that every thread can run
+        // stays in place (see AppendClassifiedPrelude), so whatever it reads
+        // stays in place too.
+        bool both_in_place =
+            producer_needs && consumer_needs && RunsForEveryThread(summary);
+        if (shared_needs || (!producer_needs && !consumer_needs) ||
+            both_in_place) {
           shared_live.AddUses(summary);
         }
         if (producer_needs) {
@@ -2417,6 +2451,11 @@ private:
                                 rewriter_->producer_prelude_live_seed_,
                                 rewriter_->consumer_prelude_live_seed_);
         if (across_control_flow && stmt.as<BindNode>()) {
+          placement = PreludeStmtPlacement::kKeepSharedPrelude;
+        }
+        if (placement == PreludeStmtPlacement::kDuplicateToBoth &&
+            RunsForEveryThread(LocalAccessCollector::Collect(
+                stmt, rewriter_->buffer_data_to_buffer_))) {
           placement = PreludeStmtPlacement::kKeepSharedPrelude;
         }
         bool to_producer = placement == PreludeStmtPlacement::kProducerOnly ||
