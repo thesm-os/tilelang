@@ -917,6 +917,41 @@ def producer_prelude_bind_before_outer_serial():
     return main
 
 
+def local_bounds_with_converted_stage():
+    """Local variables that both partitions read bound a pipeline under an outer loop.
+
+    The consumer converts each FP8 stage of B to fp16 in shared memory before its
+    GEMM, so ThreadSync keeps a sync between the conversion and the GEMM inside the
+    loop only when it can prove that the bounds are uniform. ``start`` is set before
+    the outer loop, and ``k0`` and ``k1`` in each of its iterations.
+    """
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((64, 256), T.float16),
+        B: T.Tensor((64, 256), T.float8_e4m3fn),
+        C: T.Tensor((128, 64), T.float32),
+    ):
+        with T.Kernel(1, threads=128) as _:
+            A_s = T.alloc_shared((64, 32), T.float16)
+            B_8 = T.alloc_shared((64, 32), T.float8_e4m3fn)
+            B_s = T.alloc_shared((64, 32), T.float16)
+            C_l = T.alloc_fragment((64, 64), T.float32)
+            start = T.alloc_var(T.int32, init=0)
+            for p in T.serial(2):
+                k0 = T.alloc_var(T.int32, init=start + p * 4)
+                k1 = T.alloc_var(T.int32, init=k0 + 4)
+                T.clear(C_l)
+                for k in T.Pipelined(k1 - k0, num_stages=2):
+                    T.copy(A[0, (k0 + k) * 32], A_s)
+                    T.copy(B[0, (k0 + k) * 32], B_8)
+                    T.copy(B_8, B_s)
+                    T.gemm(A_s, B_s, C_l, transpose_B=True)
+                T.copy(C_l, C[p * 64, 0])
+
+    return main
+
+
 def _compile_ws(func):
     assert "tl_tiled_ws_applied" in _apply_ws_pass(func)["main"].script()
     return tilelang.compile(
@@ -1019,6 +1054,30 @@ def test_ws_producer_prelude_before_outer_loop():
     A, B, _ = _prelude_inputs(K=160)
     ref = A[:, 32:].float() @ B[:, 32:].float().T
     torch.testing.assert_close(kernel(A, B), ref.repeat(2, 1), rtol=1e-2, atol=1e-2)
+
+
+@tilelang.testing.requires_cuda
+def test_ws_keeps_local_bounds_of_both_partitions_in_place():
+    """Each thread sets the local bounds once, outside the guards of the partitions."""
+    script = _apply_ws_pass(local_bounds_with_converted_stage())["main"].script()
+    assert "tl_tiled_ws_applied" in script
+    assert script.count("start[0] = 0") == 1, "the start is set once for every thread"
+    assert script.count("k0[0] = start[0] + p * 4") == 1, "k0 is set once for every thread"
+    assert script.count("k1[0] = k0[0] + 4") == 1, "k1 is set once for every thread"
+    assert script.index("k1[0] = k0[0] + 4") < script.index('"kWarpSpecializationScope"'), "k1 is set before the partitions"
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
+def test_ws_local_bounds_keep_the_sync_of_a_converted_stage():
+    import torch
+
+    kernel = _compile_ws(local_bounds_with_converted_stage())
+    torch.manual_seed(0)
+    A = torch.randn(64, 256, dtype=torch.float16, device="cuda")
+    B = torch.randn(64, 256, dtype=torch.float16, device="cuda").to(torch.float8_e4m3fn)
+    ref = torch.cat([A[:, 128 * p : 128 * (p + 1)].float() @ B[:, 128 * p : 128 * (p + 1)].float().T for p in range(2)])
+    torch.testing.assert_close(kernel(A, B), ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
